@@ -27,6 +27,9 @@
   <a href="https://vercel.com/">
     <img src="https://img.shields.io/badge/Vercel-Deploy-black.svg?logo=vercel&logoColor=white" alt="Vercel">
   </a>
+  <a href="https://pages.edgeone.ai/">
+    <img src="https://img.shields.io/badge/EdgeOne-Pages-blue.svg?logo=cloudflare&logoColor=blue" alt="EdgeOne Pages">
+  </a>
 </p>
 
 
