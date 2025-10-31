@@ -66,9 +66,9 @@
 
 
 
-## 🚀 快速部署
+# 🚀 快速部署
 
-### Cloudflare Pages 部署
+## Cloudflare Pages 部署
 1. Fork该项目
 2. 进入 [Cloudflare Pages](https://dash.cloudflare.com)，点击"创建项目"
 3. 连接你的 GitHub 仓库
@@ -83,7 +83,7 @@
 
 
 
-### Vercel 部署
+## Vercel 部署
 1. Fork该项目
 2. 进入 [Vercel Dashboard](https://vercel.com/dashboard)
 3. 点击 "Add new project"，连接你的 GitHub 仓库
@@ -151,7 +151,7 @@
 
 
 
-## 配置数据库
+# 配置数据库
 
 ### Cloudflare Pages (D1 数据库)
 1. 在 Cloudflare 创建 D1 数据库，命名为 `domain`
