@@ -100,5 +100,3 @@ jobs:
           [ -n "$WEBDAV_PASS" ] && PY_ARGS+=( --webdav-pass "$WEBDAV_PASS" )
 
           python ./domain.py "${PY_ARGS[@]}"
-
-
