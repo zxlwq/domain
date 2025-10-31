@@ -1,0 +1,1484 @@
+import React, { useEffect, useState, useRef } from 'react';
+
+// 声明全局背景图片管理工具类型
+declare global {
+  interface Window {
+    BackgroundImageManager: {
+      getAllBackgroundImages(): Promise<string[]>;
+      preloadAll(): Promise<string[]>;
+      preloadCustom(): void;
+    };
+  }
+}
+import {
+  fetchDomains,
+  saveDomains,
+  deleteDomain,
+  notifyExpiring,
+  fetchNotificationSettingsFromServer,
+  saveNotificationSettingsToServer,
+  verifyAdminPassword,
+  webdavBackup,
+  webdavRestore,
+  logAccess,
+  logSystem
+} from './api';
+import { Domain, defaultDomain, SortOrder, NotificationMethod } from './types';
+import { 
+  calculateProgress, 
+  getDaysLeft, 
+  copyToClipboard, 
+  getTodayString, 
+  getDeviceInfo
+} from './utils';
+
+// 导入组件
+import StatsGrid from './components/Stats';
+import DomainTable from './components/Table';
+import DomainModal from './components/Domain';
+import ConfirmModal from './components/Confirm';
+import ExpireModal from './components/Expire';
+import InfoModal from './components/Info';
+import PasswordModal from './components/Password';
+import SettingsModal from './components/Settings';
+import LogsModal from './components/Logs';
+
+const App: React.FC = () => {
+  // 状态管理
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [domains, setDomains] = useState<Domain[]>([]);
+  const [search, setSearch] = useState('');
+  const [sortField, setSortField] = useState<string | null>(null);
+  const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
+  const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
+  const [showRegistrar] = useState(true);
+  const [showProgress] = useState(true);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+
+  // 模态框状态
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editIndex, setEditIndex] = useState<number>(-1);
+  const [form, setForm] = useState<Domain>(defaultDomain);
+  const [expireModal, setExpireModal] = useState(false);
+  const [expiringDomains, setExpiringDomains] = useState<Domain[]>([]);
+  const [deleteModal, setDeleteModal] = useState(false);
+  const [domainToDelete, setDomainToDelete] = useState<Domain | null>(null);
+  const [domainToRenew, setDomainToRenew] = useState<Domain | null>(null);
+  const [batchDeleteModal, setBatchDeleteModal] = useState(false);
+  const [passwordModal, setPasswordModal] = useState(false);
+  const [passwordAction, setPasswordAction] = useState<'delete' | 'batchDelete' | 'edit' | 'renew' | null>(null);
+  const [infoModal, setInfoModal] = useState(false);
+  const [infoMessage, setInfoMessage] = useState('');
+  const [infoTitle, setInfoTitle] = useState('');
+  const [settingsModal, setSettingsModal] = useState(false);
+  const [logsModal, setLogsModal] = useState(false);
+
+  // 通知相关状态
+  const [warningDays, setWarningDays] = useState(() => localStorage.getItem('notificationWarningDays') || '15');
+  const [notificationEnabled, setNotificationEnabled] = useState(() => localStorage.getItem('notificationEnabled') || 'true');
+  const [notificationInterval, setNotificationInterval] = useState(() => localStorage.getItem('notificationInterval') || 'daily');
+  const [notificationMethods, setNotificationMethods] = useState<NotificationMethod[]>(() => {
+    const saved = localStorage.getItem('notificationMethods');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  });
+  const [dontRemindToday, setDontRemindToday] = useState(() => {
+    const dontRemindDate = localStorage.getItem('dontRemindToday');
+    return dontRemindDate === getTodayString();
+  });
+  const [notificationSentToday, setNotificationSentToday] = useState(() => {
+    const lastNotificationDate = localStorage.getItem('lastNotificationDate');
+    return lastNotificationDate === getTodayString();
+  });
+  const [isCheckingExpiring, setIsCheckingExpiring] = useState(false);
+
+  // 背景图片相关状态
+  const [bgImageUrl, setBgImageUrl] = useState(() => localStorage.getItem('customBgImageUrl') || '');
+  const [carouselImages, setCarouselImages] = useState<string[]>([]);
+  const [carouselInterval, setCarouselInterval] = useState(() => {
+    const val = localStorage.getItem('carouselInterval');
+    return val ? Number(val) : 30;
+  });
+  const [carouselEnabled, setCarouselEnabled] = useState(() => {
+    const val = localStorage.getItem('carouselEnabled');
+    return val ? val === 'true' : true;
+  });
+  const [bgImageLoaded, setBgImageLoaded] = useState(false);
+  const [bgImageError, setBgImageError] = useState(false);
+  const carouselIndex = useRef(0);
+  const carouselTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const imageCache = useRef<Map<string, boolean>>(new Map());
+
+  // 操作消息
+  const [opMsg, setOpMsg] = useState('');
+  useEffect(() => {
+    if (opMsg) {
+      const t = setTimeout(() => setOpMsg(''), 3000);
+      return () => clearTimeout(t);
+    }
+  }, [opMsg]);
+
+  // 图片预加载函数
+  const preloadImage = (src: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      // 检查缓存
+      if (imageCache.current.has(src)) {
+        resolve(true);
+        return;
+      }
+
+      const img = new Image();
+      img.onload = () => {
+        imageCache.current.set(src, true);
+        resolve(true);
+      };
+      img.onerror = () => {
+        imageCache.current.set(src, false);
+        resolve(false);
+      };
+      img.src = src;
+    });
+  };
+
+  // 预加载所有背景图片
+  const preloadAllBackgroundImages = async () => {
+    try {
+      // 使用全局背景图片管理工具
+      if (window.BackgroundImageManager) {
+        const allImages = await window.BackgroundImageManager.getAllBackgroundImages();
+        
+        // 添加自定义背景图
+        const imagesToPreload = [...allImages];
+        if (bgImageUrl && bgImageUrl.trim() !== '') {
+          imagesToPreload.push(bgImageUrl);
+        }
+        
+        // 去重
+        const uniqueImages = [...new Set(imagesToPreload)];
+        
+        // 并行预加载所有图片
+        const preloadPromises = uniqueImages.map(src => preloadImage(src));
+        await Promise.allSettled(preloadPromises);
+        
+        console.log('React组件预加载背景图片:', uniqueImages);
+      } else {
+        // 降级处理：使用原有逻辑
+        const imagesToPreload: string[] = [];
+        
+        // 添加自定义背景图
+        if (bgImageUrl && bgImageUrl.trim() !== '') {
+          imagesToPreload.push(bgImageUrl);
+        }
+        
+        // 添加轮播图片
+        carouselImages.forEach(imageName => {
+          imagesToPreload.push(`/image/${imageName}`);
+        });
+        
+        // 添加默认背景图
+        imagesToPreload.push('/image/background.webp');
+        
+        // 去重
+        const uniqueImages = [...new Set(imagesToPreload)];
+        
+        // 并行预加载所有图片
+        const preloadPromises = uniqueImages.map(src => preloadImage(src));
+        await Promise.allSettled(preloadPromises);
+      }
+    } catch (error) {
+      console.error('预加载背景图片失败:', error);
+    }
+  };
+
+  // 初始化
+  useEffect(() => {
+    // 立即设置背景图状态，不等待异步加载
+    const initializeBackground = () => {
+      const customBgUrl = localStorage.getItem('customBgImageUrl');
+      if (customBgUrl && customBgUrl.trim() !== '') {
+        // 有自定义背景图，立即显示
+        document.body.style.backgroundImage = `url('${customBgUrl}')`;
+        document.body.style.backgroundSize = 'cover';
+        document.body.style.backgroundRepeat = 'no-repeat';
+        document.body.style.backgroundPosition = 'center center';
+        const isMobile = window.innerWidth <= 768;
+        document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+        document.body.className = 'bg-loaded';
+        setBgImageLoaded(true);
+      } else {
+        // 使用默认背景图
+        document.body.style.backgroundImage = `url('/image/background.webp')`;
+        document.body.style.backgroundSize = 'cover';
+        document.body.style.backgroundRepeat = 'no-repeat';
+        document.body.style.backgroundPosition = 'center center';
+        const isMobile = window.innerWidth <= 768;
+        document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+        document.body.className = 'bg-loaded';
+        setBgImageLoaded(true);
+      }
+    };
+
+    // 立即初始化背景图
+    initializeBackground();
+
+    loadDomains();
+    loadCarouselImages();
+    loadNotificationSettings();
+    
+    // 记录访问日志
+    const deviceInfo = getDeviceInfo();
+    logAccess(
+      'access',
+      '用户访问域名管理面板',
+      'success',
+      deviceInfo
+    ).catch(error => {
+      console.error('记录访问日志失败:', error);
+    });
+  }, []);
+
+  // 每天开始时重置通知状态
+  useEffect(() => {
+    const lastNotificationDate = localStorage.getItem('lastNotificationDate');
+    if (lastNotificationDate !== getTodayString()) {
+      setNotificationSentToday(false);
+    }
+    
+    const dontRemindDate = localStorage.getItem('dontRemindToday');
+    const shouldDontRemind = dontRemindDate === getTodayString();
+    setDontRemindToday(shouldDontRemind);
+  }, []);
+
+  // 预加载所有背景图片
+  useEffect(() => {
+    if (carouselImages.length > 0) {
+      preloadAllBackgroundImages().then(() => {
+        console.log('所有背景图片预加载完成');
+      }).catch(error => {
+        console.error('背景图片预加载失败:', error);
+      });
+    }
+  }, [carouselImages, bgImageUrl]);
+
+  // 背景图片轮播
+  useEffect(() => {
+    // 更新背景图样式的函数
+    async function updateBackgroundStyles() {
+      // 重置状态和CSS类
+      setBgImageLoaded(false);
+      setBgImageError(false);
+      document.body.className = 'bg-loading';
+
+      if (bgImageUrl && bgImageUrl.trim() !== '') {
+        // 预加载自定义背景图
+        const isLoaded = await preloadImage(bgImageUrl);
+        if (isLoaded) {
+          document.body.style.backgroundImage = `url('${bgImageUrl}')`;
+          document.body.style.backgroundSize = 'cover';
+          document.body.style.backgroundRepeat = 'no-repeat';
+          document.body.style.backgroundPosition = 'center center';
+          // 根据屏幕尺寸设置background-attachment
+          const isMobile = window.innerWidth <= 768;
+          document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+          document.body.className = 'bg-loaded';
+          setBgImageLoaded(true);
+        } else {
+          setBgImageError(true);
+          // 使用默认背景图作为降级
+          document.body.style.backgroundImage = `url('/image/background.webp')`;
+          document.body.style.backgroundSize = 'cover';
+          document.body.style.backgroundRepeat = 'no-repeat';
+          document.body.style.backgroundPosition = 'center center';
+          const isMobile = window.innerWidth <= 768;
+          document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+          document.body.className = 'bg-loaded';
+        }
+        
+        if (carouselTimer.current) {
+          clearInterval(carouselTimer.current);
+          carouselTimer.current = null;
+        }
+        return;
+      }
+      
+      if (carouselImages.length === 0) return;
+      
+      async function setBg(idx: number) {
+        const url = `/image/${carouselImages[idx]}`;
+        const isLoaded = await preloadImage(url);
+        if (isLoaded) {
+          document.body.style.backgroundImage = `url('${url}')`;
+          document.body.style.backgroundSize = 'cover';
+          document.body.style.backgroundRepeat = 'no-repeat';
+          document.body.style.backgroundPosition = 'center center';
+          // 根据屏幕尺寸设置background-attachment
+          const isMobile = window.innerWidth <= 768;
+          document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+          document.body.className = 'bg-loaded';
+          setBgImageLoaded(true);
+        } else {
+          setBgImageError(true);
+          // 使用默认背景图作为降级
+          document.body.style.backgroundImage = `url('/image/background.webp')`;
+          document.body.style.backgroundSize = 'cover';
+          document.body.style.backgroundRepeat = 'no-repeat';
+          document.body.style.backgroundPosition = 'center center';
+          const isMobile = window.innerWidth <= 768;
+          document.body.style.backgroundAttachment = isMobile ? 'scroll' : 'fixed';
+          document.body.className = 'bg-loaded';
+        }
+      }
+      
+      // 先清除现有定时器
+      if (carouselTimer.current) {
+        clearInterval(carouselTimer.current);
+        carouselTimer.current = null;
+      }
+      
+      // 设置初始背景图
+      await setBg(carouselIndex.current);
+      
+      // 只有在轮播启用且有多张图片时才启动定时器
+      if (carouselEnabled && carouselImages.length > 1) {
+        console.log('启动背景图轮播:', {
+          carouselEnabled,
+          carouselImages: carouselImages.length,
+          carouselInterval,
+          currentIndex: carouselIndex.current
+        });
+        carouselTimer.current = setInterval(async () => {
+          carouselIndex.current = (carouselIndex.current + 1) % carouselImages.length;
+          console.log('轮播切换到图片:', carouselIndex.current, carouselImages[carouselIndex.current]);
+          await setBg(carouselIndex.current);
+        }, carouselInterval * 1000);
+      } else {
+        console.log('轮播未启动:', {
+          carouselEnabled,
+          carouselImages: carouselImages.length,
+          reason: !carouselEnabled ? '轮播未启用' : '图片数量不足'
+        });
+      }
+    }
+
+    // 只有在需要更新时才调用
+    if (bgImageUrl || carouselImages.length > 0) {
+      updateBackgroundStyles();
+    }
+
+    // 监听窗口大小变化
+    const handleResize = () => {
+      if (bgImageUrl || carouselImages.length > 0) {
+        updateBackgroundStyles();
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    
+    return () => {
+      if (carouselTimer.current) {
+        clearInterval(carouselTimer.current);
+        carouselTimer.current = null;
+      }
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [bgImageUrl, carouselImages, carouselInterval, carouselEnabled]);
+
+  // 组件卸载时清理定时器
+  useEffect(() => {
+    return () => {
+      if (carouselTimer.current) {
+        clearInterval(carouselTimer.current);
+        carouselTimer.current = null;
+      }
+    };
+  }, []);
+
+  // 移除 useEffect 中的检查，改为在 loadDomains 中直接调用，避免重复触发
+
+  // 数据加载函数
+  async function loadDomains() {
+    setLoading(true);
+    try {
+      const data = await fetchDomains();
+      setDomains(data);
+      // 域名加载完成后触发检查
+      if (!dontRemindToday && data.length > 0 && !isCheckingExpiring) {
+        checkExpiringDomains(data).catch(error => {
+          console.error('检查到期域名时出错:', error);
+          // 记录检查失败的系统日志
+          const deviceInfo = getDeviceInfo();
+          logSystem(
+            'check_error',
+            `检查到期域名时发生错误: ${error instanceof Error ? error.message : '未知错误'}`,
+            'error',
+            deviceInfo
+          ).catch(logError => {
+            console.error('记录系统日志失败:', logError);
+          });
+        });
+      }
+    } catch (error: any) {
+      const errorMessage = error.message || '加载域名失败';
+      setOpMsg(`加载失败: ${errorMessage}`);
+      console.error('加载域名失败:', error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadNotificationSettings() {
+    try {
+      const data = await fetchNotificationSettingsFromServer();
+      if (data.success && data.settings) {
+        setWarningDays(data.settings.warningDays);
+        setNotificationEnabled(data.settings.notificationEnabled);
+        setNotificationInterval(data.settings.notificationInterval);
+        
+        // 优先使用本地存储的通知方式，如果本地没有则使用服务器设置
+        const localMethods = localStorage.getItem('notificationMethods');
+        if (localMethods) {
+          try {
+            const parsedLocalMethods = JSON.parse(localMethods);
+            if (Array.isArray(parsedLocalMethods) && parsedLocalMethods.length > 0) {
+              setNotificationMethods(parsedLocalMethods);
+              return; // 使用本地存储的设置，不覆盖
+            }
+          } catch {
+            // 本地存储解析失败，继续使用服务器设置
+          }
+        }
+        
+        // 如果本地存储没有有效的通知方式，则使用服务器设置
+        // 兼容后端返回的两种字段：notificationMethod(数组) 与 notificationMethods
+        let methods = (data as any).settings.notificationMethod ?? (data as any).settings.notificationMethods;
+        if (Array.isArray(methods)) {
+          setNotificationMethods(methods);
+          localStorage.setItem('notificationMethods', JSON.stringify(methods));
+        }
+        else if (typeof methods === 'string') {
+          try { 
+            const parsedMethods = JSON.parse(methods);
+            setNotificationMethods(parsedMethods);
+            localStorage.setItem('notificationMethods', methods);
+          } catch { 
+            setNotificationMethods([]);
+            localStorage.setItem('notificationMethods', JSON.stringify([]));
+          }
+        } else {
+          setNotificationMethods([]);
+          localStorage.setItem('notificationMethods', JSON.stringify([]));
+        }
+        // 同步背景相关设置（若本地无值或已清空）
+        const serverBgUrl = (data as any).settings.bgImageUrl ?? '';
+        const serverCarouselInterval = (data as any).settings.carouselInterval ?? 30;
+        const serverCarouselEnabled = (data as any).settings.carouselEnabled ?? 'true';
+
+        const localBg = localStorage.getItem('customBgImageUrl');
+        const localCarouselEnabled = localStorage.getItem('carouselEnabled');
+        const localCarouselInterval = localStorage.getItem('carouselInterval');
+
+        if (!localBg && serverBgUrl) {
+          setBgImageUrl(serverBgUrl);
+          localStorage.setItem('customBgImageUrl', serverBgUrl);
+        }
+        if (!localCarouselInterval && typeof serverCarouselInterval === 'number') {
+          setCarouselInterval(serverCarouselInterval);
+          localStorage.setItem('carouselInterval', String(serverCarouselInterval));
+        }
+        if (!localCarouselEnabled && typeof serverCarouselEnabled === 'string') {
+          setCarouselEnabled(serverCarouselEnabled === 'true');
+          localStorage.setItem('carouselEnabled', serverCarouselEnabled);
+        }
+      }
+    } catch (error: any) {
+      console.error('加载通知设置失败:', error);
+      // 静默失败，不影响主要功能
+    }
+  }
+
+  function loadCarouselImages() {
+    fetch('/image/images.json')
+      .then(res => res.text())
+      .then(txt => {
+        let data: string[] = [];
+        try { data = JSON.parse(txt); } catch {}
+        if (!Array.isArray(data) || data.length === 0) data = ["background.webp"];
+        setCarouselImages(data);
+      })
+      .catch(() => setCarouselImages(["background.webp"]));
+  }
+
+  // 到期域名检查
+  async function checkExpiringDomains(domains: Domain[]) {
+    if (dontRemindToday) {
+      return;
+    }
+    if (isCheckingExpiring) {
+      return; // 防止重复检查
+    }
+    
+    // 移除这个检查，让弹窗始终显示（除非用户选择"今天不再提醒"）
+    
+    setIsCheckingExpiring(true);
+    
+    try {
+      // 检查本地通知设置
+      const localNotificationEnabled = notificationEnabled === 'true';
+      if (!localNotificationEnabled) {
+        // 记录系统日志 - 通知未启用
+        const deviceInfo = getDeviceInfo();
+        logSystem(
+          'notification_disabled',
+          '本地通知功能未启用，跳过到期域名检查',
+          'warning',
+          deviceInfo
+        ).catch(error => {
+          console.error('记录系统日志失败:', error);
+        });
+        return;
+      }
+      
+      // 检查是否有配置通知方式
+      const localMethods = localStorage.getItem('notificationMethods');
+      let hasNotificationMethods = false;
+      if (localMethods) {
+        try {
+          const parsedMethods = JSON.parse(localMethods);
+          hasNotificationMethods = Array.isArray(parsedMethods) && parsedMethods.length > 0;
+        } catch (error) {
+          console.error('解析本地通知方式失败:', error);
+          hasNotificationMethods = false;
+        }
+      }
+      
+      // 如果没有配置通知方式，尝试从服务器获取
+      if (!hasNotificationMethods) {
+        const settingsData = await fetchNotificationSettingsFromServer();
+        if (settingsData.success && settingsData.settings) {
+          const settings = settingsData.settings;
+          const serverNotificationEnabled = settings.notificationEnabled === 'true';
+          if (!serverNotificationEnabled) {
+            return;
+          }
+          
+          let methods = settings.notificationMethods;
+          if (Array.isArray(methods)) {
+            hasNotificationMethods = methods.length > 0;
+          } else if (typeof methods === 'string') {
+            try {
+              const parsedMethods = JSON.parse(methods);
+              hasNotificationMethods = Array.isArray(parsedMethods) && parsedMethods.length > 0;
+            } catch (error) {
+              console.error('解析服务器通知方式失败:', error);
+              hasNotificationMethods = false;
+            }
+          }
+        }
+      }
+      
+      if (!hasNotificationMethods) {
+        // 记录系统日志 - 未配置通知方式
+        const deviceInfo = getDeviceInfo();
+        logSystem(
+          'no_notification_methods',
+          '未找到有效的通知方式配置，跳过到期域名检查',
+          'warning',
+          deviceInfo
+        ).catch(error => {
+          console.error('记录系统日志失败:', error);
+        });
+        return;
+      }
+      
+      // 使用本地设置或服务器设置的警告天数
+      const localWarningDays = parseInt(warningDays || '15', 10);
+      const today = new Date();
+      const warningDate = new Date(today.getTime() + localWarningDays * 24 * 60 * 60 * 1000);
+      
+      const expiring = domains.filter(domain => {
+        const expire_date = new Date(domain.expire_date);
+        return expire_date <= warningDate && expire_date >= today;
+      });
+      
+      setExpiringDomains(expiring);
+      
+      // 记录检查结果
+      const deviceInfo = getDeviceInfo();
+      if (expiring.length > 0) {
+        // 只在弹窗未显示时显示弹窗
+        if (!expireModal) {
+          setExpireModal(true);
+        }
+        
+        // 先记录找到到期域名的日志
+        await logSystem(
+          'expiring_domains_found',
+          `找到 ${expiring.length} 个即将到期的域名，警告天数: ${localWarningDays}天`,
+          'warning',
+          deviceInfo
+        ).catch(error => {
+          console.error('记录系统日志失败:', error);
+        });
+        
+        // 然后处理通知发送
+        if (!notificationSentToday) {
+          try {
+            await notifyExpiring(expiring);
+            localStorage.setItem('lastNotificationDate', getTodayString());
+            setNotificationSentToday(true);
+            
+            // 记录通知发送成功
+            await logSystem(
+              'notification_sent',
+              `成功发送到期通知，涉及 ${expiring.length} 个域名`,
+              'success',
+              deviceInfo
+            ).catch(error => {
+              console.error('记录系统日志失败:', error);
+            });
+          } catch (error) {
+            console.error('发送通知失败:', error);
+            
+            // 记录通知发送失败
+            await logSystem(
+              'notification_failed',
+              `发送到期通知失败: ${error instanceof Error ? error.message : '未知错误'}`,
+              'error',
+              deviceInfo
+            ).catch(logError => {
+              console.error('记录系统日志失败:', logError);
+            });
+          }
+        } else {
+          // 记录今日已发送过通知
+          await logSystem(
+            'notification_already_sent',
+            '今日已发送过到期通知，跳过重复发送',
+            'success',
+            deviceInfo
+          ).catch(error => {
+            console.error('记录系统日志失败:', error);
+          });
+        }
+      } else {
+        // 记录没有到期域名的日志
+        logSystem(
+          'no_expiring_domains',
+          `检查完成，没有即将到期的域名，警告天数: ${localWarningDays}天`,
+          'success',
+          deviceInfo
+        ).catch(error => {
+          console.error('记录系统日志失败:', error);
+        });
+      }
+    } catch (error: any) {
+      console.error('检查到期域名时出错:', error);
+      
+      // 记录系统错误日志
+      const deviceInfo = getDeviceInfo();
+      logSystem(
+        'check_error',
+        `检查到期域名时发生错误: ${error.message || '未知错误'}`,
+        'error',
+        deviceInfo
+      ).catch(logError => {
+        console.error('记录系统日志失败:', logError);
+      });
+      
+      // 静默失败，不影响主要功能
+    } finally {
+      setIsCheckingExpiring(false);
+    }
+  }
+
+  // 表格操作函数
+  function handleSort(field: string) {
+    setSortField(field);
+    setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
+  }
+
+  function handleSelectAll(checked: boolean) {
+    if (checked) {
+      // 获取当前页面的域名索引
+      const filteredDomains = domains.filter((domain: Domain) =>
+        domain.domain.toLowerCase().includes(search.toLowerCase()) ||
+        domain.registrar.toLowerCase().includes(search.toLowerCase()) ||
+        domain.status.toLowerCase().includes(search.toLowerCase())
+      );
+      
+      // 对过滤后的域名进行排序
+      let sortedDomains = [...filteredDomains];
+      if (sortField) {
+        sortedDomains = sortedDomains.sort((a: Domain, b: Domain) => {
+          let valA: any = a[sortField as keyof Domain];
+          let valB: any = b[sortField as keyof Domain];
+          if (sortField === 'daysLeft') {
+            valA = getDaysLeft(a.expire_date);
+            valB = getDaysLeft(b.expire_date);
+          }
+          if (sortField === 'progress') {
+            valA = calculateProgress(a.register_date, a.expire_date);
+            valB = calculateProgress(b.register_date, b.expire_date);
+          }
+          if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+          if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+          return 0;
+        });
+      } else {
+        sortedDomains = sortedDomains.sort((a: Domain, b: Domain) => new Date(a.expire_date).getTime() - new Date(b.expire_date).getTime());
+      }
+      
+      // 获取当前页面的域名
+      const startIndex = (page - 1) * pageSize;
+      const endIndex = startIndex + pageSize;
+      const currentPageDomains = sortedDomains.slice(startIndex, endIndex);
+      
+      // 获取这些域名在原始数组中的索引
+      const currentPageIndexes = currentPageDomains.map(domain => domains.findIndex((d: Domain) => d.domain === domain.domain));
+      setSelectedIndexes(currentPageIndexes);
+    } else {
+      setSelectedIndexes([]);
+    }
+  }
+
+  function handleSelectRow(index: number, checked: boolean) {
+    setSelectedIndexes((prev: number[]) => checked ? [...prev, index] : prev.filter((i: number) => i !== index));
+  }
+
+  function handleEdit(index: number) {
+    setEditIndex(index);
+    setForm(domains[index]);
+    setPasswordAction('edit');
+    setPasswordModal(true);
+  }
+
+  function handleDelete(index: number) {
+    setDomainToDelete(domains[index]);
+    setPasswordAction('delete');
+    setPasswordModal(true);
+  }
+
+  function handleRenew(domain: Domain) {
+    setDomainToRenew(domain);
+    setPasswordAction('renew');
+    setPasswordModal(true);
+  }
+
+  function performRenew(domain: Domain) {
+    if (domain.renewUrl && domain.renewUrl.trim() !== '') {
+      window.open(domain.renewUrl, '_blank');
+    } else {
+      showInfoModal('续期提示', `请联系注册商 ${domain.registrar} 对域名 ${domain.domain} 进行续期操作。`);
+    }
+  }
+
+  function handleCopy(domain: string) {
+    copyToClipboard(domain).then(() => {
+      setOpMsg('域名已复制到剪贴板');
+    });
+  }
+
+  function handleBatchOperation(operation: string) {
+    if (operation === 'expired') handleBatchSetStatus('expired');
+    else if (operation === 'active') handleBatchSetStatus('active');
+    else if (operation === 'delete') handleBatchDelete();
+  }
+
+  // 批量操作
+  async function handleBatchSetStatus(status: string) {
+    if (selectedIndexes.length === 0) {
+      showInfoModal('提示', '请先选择要操作的域名');
+      return;
+    }
+    
+    const validStatus = (status: string): 'active' | 'expired' | 'pending' => {
+      if (status === 'active' || status === 'expired' || status === 'pending') return status;
+      return 'pending';
+    };
+    
+    const domainsToUpdate = selectedIndexes.map((idx: number) => domains[idx]);
+    const newDomains = domains.map((d: Domain) => {
+      const domainToUpdate = domainsToUpdate.find((updateDomain: Domain) => updateDomain.domain === d.domain);
+      return domainToUpdate ? { ...d, status: validStatus(status) } : d;
+    });
+    
+    await saveDomains(newDomains);
+    setSelectedIndexes([]);
+    await loadDomains();
+    setOpMsg('批量状态修改成功');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  async function handleBatchDelete() {
+    if (selectedIndexes.length === 0) {
+      showInfoModal('提示', '请先选择要删除的域名');
+      return;
+    }
+    setPasswordAction('batchDelete');
+    setPasswordModal(true);
+  }
+
+  async function confirmBatchDelete() {
+    try {
+      setDeleting(true);
+    const domainsToDelete = selectedIndexes.map((idx: number) => domains[idx]);
+    const newDomains = domains.filter((domain: Domain) => !domainsToDelete.some((d: Domain) => d.domain === domain.domain));
+      
+      // 立即更新本地状态，提供即时反馈
+      setDomains(newDomains);
+    setSelectedIndexes([]);
+    setOpMsg('批量删除成功');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setBatchDeleteModal(false);
+      
+      // 异步保存到服务器
+      await saveDomains(newDomains);
+    } catch (error: any) {
+      // 如果保存失败，回滚本地状态
+      await loadDomains();
+      const errorMessage = error.message || '批量删除失败';
+      setOpMsg(`批量删除失败: ${errorMessage}`);
+      console.error('批量删除失败:', error);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  // 模态框操作
+  function handleAdd() {
+    setEditIndex(-1);
+    setForm(defaultDomain);
+    setModalOpen(true);
+  }
+
+  async function handleFormSubmit(domain: Domain) {
+    try {
+      setSaving(true);
+    let newDomains = [...domains];
+    if (editIndex >= 0) {
+      newDomains[editIndex] = domain;
+    } else {
+      newDomains.push(domain);
+    }
+      
+      // 立即更新本地状态，提供即时反馈
+      setDomains(newDomains);
+    setModalOpen(false);
+    setEditIndex(-1);
+    setForm(defaultDomain);
+    setOpMsg('保存成功');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+      
+      // 异步保存到服务器
+      await saveDomains(newDomains);
+    } catch (error: any) {
+      // 如果保存失败，回滚本地状态
+      await loadDomains();
+      const errorMessage = error.message || '保存失败';
+      setOpMsg(`保存失败: ${errorMessage}`);
+      console.error('保存域名失败:', error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleFormChange(field: string, value: string) {
+    setForm((prev: Domain) => ({ ...prev, [field]: value }));
+  }
+
+  async function handlePasswordConfirm(password: string) {
+    try {
+      const isValid = await verifyAdminPassword(password);
+      
+      if (!isValid) {
+        showInfoModal('密码错误', '管理员密码不正确，请重试');
+        return;
+      }
+      
+      // 密码验证成功，执行相应的操作
+      if (passwordAction === 'delete' && domainToDelete) {
+        try {
+          setDeleting(true);
+          // 立即更新本地状态，提供即时反馈
+          const updatedDomains = domains.filter(d => d.domain !== domainToDelete.domain);
+          setDomains(updatedDomains);
+        setOpMsg('域名删除成功');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        setDomainToDelete(null);
+          setPasswordModal(false);
+          setPasswordAction(null);
+          
+          // 异步删除服务器数据
+          await deleteDomain(domainToDelete.domain);
+        } catch (error: any) {
+          // 如果删除失败，回滚本地状态
+          await loadDomains();
+          const errorMessage = error.message || '删除失败';
+          setOpMsg(`删除失败: ${errorMessage}`);
+          console.error('删除域名失败:', error);
+        } finally {
+          setDeleting(false);
+        }
+      } else if (passwordAction === 'batchDelete') {
+        setBatchDeleteModal(true);
+        setPasswordModal(false);
+        setPasswordAction(null);
+      } else if (passwordAction === 'edit') {
+        setModalOpen(true);
+        setPasswordModal(false);
+        setPasswordAction(null);
+      } else if (passwordAction === 'renew' && domainToRenew) {
+        performRenew(domainToRenew);
+        setDomainToRenew(null);
+      setPasswordModal(false);
+      setPasswordAction(null);
+      }
+      
+    } catch (error: any) {
+      console.error('密码验证失败:', error);
+      const errorMessage = error.message || '密码验证过程中发生错误';
+      showInfoModal('验证失败', `请重试: ${errorMessage}`);
+    }
+  }
+
+  function handlePasswordCancel() {
+    const currentAction = passwordAction;
+    setPasswordModal(false);
+    setPasswordAction(null);
+    setDomainToDelete(null);
+    setDomainToRenew(null);
+    if (currentAction === 'edit') {
+      setEditIndex(-1);
+      setForm(defaultDomain);
+    }
+  }
+
+  async function confirmDelete() {
+    if (domainToDelete) {
+      try {
+        setDeleting(true);
+        // 立即更新本地状态，提供即时反馈
+        const updatedDomains = domains.filter(d => d.domain !== domainToDelete.domain);
+        setDomains(updatedDomains);
+      setOpMsg('域名删除成功');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    setDeleteModal(false);
+    setDomainToDelete(null);
+        
+        // 异步删除服务器数据
+        await deleteDomain(domainToDelete.domain);
+      } catch (error: any) {
+        // 如果删除失败，回滚本地状态
+        await loadDomains();
+        const errorMessage = error.message || '删除失败';
+        setOpMsg(`删除失败: ${errorMessage}`);
+        console.error('删除域名失败:', error);
+      } finally {
+        setDeleting(false);
+      }
+    }
+  }
+
+  function handleCloseExpireModal(dontRemind: boolean) {
+    setExpireModal(false);
+    if (dontRemind) {
+      localStorage.setItem('dontRemindToday', getTodayString());
+      setDontRemindToday(true);
+    }
+
+  }
+
+  function showInfoModal(title: string, message: string) {
+    setInfoTitle(title);
+    setInfoMessage(message);
+    setInfoModal(true);
+  }
+
+  // 处理域名数据导入
+  async function handleImportDomains(importedDomains: Domain[]) {
+    try {
+      await saveDomains(importedDomains);
+      setDomains(importedDomains);
+      showInfoModal('✅ 导入成功', `成功导入 ${importedDomains.length} 个域名`);
+    } catch (error) {
+      showInfoModal('❌ 导入失败', error instanceof Error ? error.message : '导入失败');
+    }
+  }
+
+  async function handleSettingsSave(settings: {
+    warningDays: string;
+    notificationEnabled: string;
+    notificationInterval: string;
+    notificationMethods: NotificationMethod[];
+    bgImageUrl: string;
+    carouselInterval: number;
+    carouselEnabled: boolean;
+  }) {
+    try {
+      // 保存通知与背景设置到服务器
+      await saveNotificationSettingsToServer({
+        warningDays: settings.warningDays,
+        notificationEnabled: settings.notificationEnabled,
+        notificationInterval: settings.notificationInterval,
+        notificationMethods: settings.notificationMethods,
+        bgImageUrl: settings.bgImageUrl,
+        carouselInterval: settings.carouselInterval,
+        carouselEnabled: settings.carouselEnabled
+      });
+
+      // 更新本地状态
+      setWarningDays(settings.warningDays);
+      setNotificationEnabled(settings.notificationEnabled);
+      setNotificationInterval(settings.notificationInterval);
+      setNotificationMethods(settings.notificationMethods);
+      setBgImageUrl(settings.bgImageUrl);
+      setCarouselInterval(settings.carouselInterval);
+      setCarouselEnabled(settings.carouselEnabled);
+
+      // 保存到本地存储
+      localStorage.setItem('notificationWarningDays', settings.warningDays);
+      localStorage.setItem('notificationEnabled', settings.notificationEnabled);
+      localStorage.setItem('notificationInterval', settings.notificationInterval);
+      localStorage.setItem('notificationMethods', JSON.stringify(settings.notificationMethods));
+      localStorage.setItem('customBgImageUrl', settings.bgImageUrl);
+      localStorage.setItem('carouselInterval', settings.carouselInterval.toString());
+      localStorage.setItem('carouselEnabled', settings.carouselEnabled.toString());
+
+      setOpMsg('设置保存成功');
+    } catch (error: any) {
+      console.error('保存设置失败:', error);
+      const errorMessage = error.message || '保存设置时发生错误';
+      showInfoModal('保存失败', `请重试: ${errorMessage}`);
+    }
+  }
+
+
+  // WebDAV备份功能
+  async function handleWebDAVBackup() {
+    try {
+      const result = await webdavBackup({});
+      showInfoModal('✅ WebDAV备份成功', `成功备份 ${result.domainsCount || 0} 个域名到 ${result.filename || 'WebDAV服务器'}，备份时间: ${result.timestamp || '未知'}`);
+      setOpMsg('WebDAV备份成功');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '备份失败';
+      showInfoModal('❌ WebDAV备份失败', errorMessage);
+      throw error;
+    }
+  }
+
+  // WebDAV恢复功能
+  async function handleWebDAVRestore() {
+    try {
+      // 不指定文件名，让后端自动选择最新的备份文件
+      const result = await webdavRestore({});
+      
+      // 恢复成功后重新加载域名数据
+      await loadDomains();
+      
+      showInfoModal('✅ WebDAV恢复成功', `成功恢复 ${result.domainsCount || 0} 个域名，备份时间: ${result.timestamp || '未知'}`);
+      setOpMsg('WebDAV恢复成功');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '恢复失败';
+      showInfoModal('❌ WebDAV恢复失败', errorMessage);
+      throw error;
+    }
+  }
+
+  // 全局操作消息组件
+  const GlobalOpMsg = opMsg ? (
+    <div style={{
+      position: 'fixed',
+      top: '50%',
+      left: '50%',
+      transform: 'translate(-50%, -50%)',
+      background: 'rgba(40,40,40,0.45)',
+      color: '#fff',
+      fontSize: 18,
+      fontWeight: 600,
+      padding: '12px 32px',
+      borderRadius: 16,
+      zIndex: 99999,
+      boxShadow: '0 4px 24px rgba(0,0,0,0.18)',
+      pointerEvents: 'none',
+      textAlign: 'center',
+      letterSpacing: 1.2,
+      backdropFilter: 'blur(12px)',
+      WebkitBackdropFilter: 'blur(12px)',
+      minWidth: 180,
+      maxWidth: '80vw',
+      margin: '0 auto',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+    }}>{opMsg}</div>
+  ) : null;
+
+  // 背景图加载指示器
+  const BackgroundLoadingIndicator = !bgImageLoaded && !bgImageError ? (
+    <div className="bg-loading-indicator" style={{
+      position: 'fixed',
+      top: '20px',
+      right: '20px',
+      background: 'rgba(255, 255, 255, 0.9)',
+      color: '#333',
+      padding: '8px 16px',
+      borderRadius: 20,
+      fontSize: 14,
+      fontWeight: 500,
+      zIndex: 1000,
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      boxShadow: '0 2px 12px rgba(0,0,0,0.15)',
+      backdropFilter: 'blur(10px)',
+      WebkitBackdropFilter: 'blur(10px)',
+    }}>
+      <div style={{
+        width: '16px',
+        height: '16px',
+        border: '2px solid #667eea',
+        borderTop: '2px solid transparent',
+        borderRadius: '50%',
+        animation: 'spin 1s linear infinite',
+      }}></div>
+      加载背景图中...
+    </div>
+  ) : null;
+
+  return (
+    <div className="container" style={{ maxWidth: 1300, margin: '0 auto', padding: 20, position: 'relative', zIndex: 1 }}>
+      {GlobalOpMsg}
+      {BackgroundLoadingIndicator}
+      
+      <div className="header">
+        <h1>域名面板</h1>
+        <p>查看域名状态、注册商、注册日期、过期日期和使用进度</p>
+        <div className="logo-container" style={{ 
+          marginTop: '15px', 
+          textAlign: 'center',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: '20px',
+          flexWrap: 'wrap'
+        }}>
+          
+          <a 
+            href="https://github.com" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/github.webp" 
+              alt="Logo 1" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+
+          
+          <a 
+            href="https://gitlab.com" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/gitlab.webp" 
+              alt="Cloudflare" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+
+          
+          <a 
+            href="https://www.youtube.com" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/youtube.webp" 
+              alt="Cloudflare" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+          
+          
+          <a 
+            href="https://www.bilibili.com" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/bilibili.webp" 
+              alt="Cloudflare" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+
+          
+          <a 
+            href="https://cloudflare.com" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/cloudflare.webp" 
+              alt="Cloudflare" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+          
+          
+          <a 
+            href="https://telegram.org" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-block',
+              textDecoration: 'none',
+              transition: 'transform 0.2s ease-in-out'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            <img 
+              src="/image/logo/telegram.webp" 
+              alt="Telegram" 
+              style={{
+                height: '40px',
+                width: 'auto',
+                borderRadius: '8px',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.1))'
+              }}
+            />
+          </a>
+        </div>
+        <button className="settings-btn" onClick={() => setSettingsModal(true)}>⚙️</button>
+      </div>
+
+              <StatsGrid domains={domains} warningDays={parseInt(warningDays || '15', 10)} />
+
+      <DomainTable
+        domains={domains}
+        loading={loading}
+        search={search}
+        sortField={sortField}
+        sortOrder={sortOrder}
+        selectedIndexes={selectedIndexes}
+        showRegistrar={showRegistrar}
+        showProgress={showProgress}
+        page={page}
+        pageSize={pageSize}
+        warningDays={parseInt(warningDays || '15', 10)}
+        onSort={handleSort}
+        onSelectAll={handleSelectAll}
+        onSelectRow={handleSelectRow}
+        onEdit={handleEdit}
+        onDelete={handleDelete}
+        onRenew={handleRenew}
+        onCopy={handleCopy}
+        onBatchOperation={handleBatchOperation}
+        onPageChange={setPage}
+        onPageSizeChange={setPageSize}
+        onSearchChange={setSearch}
+      />
+
+      <button className="add-domain-btn" onClick={handleAdd}>+</button>
+
+      
+      <DomainModal
+        isOpen={modalOpen}
+        isEdit={editIndex >= 0}
+        domain={form}
+        saving={saving}
+        onClose={() => setModalOpen(false)}
+        onSubmit={handleFormSubmit}
+        onChange={handleFormChange}
+      />
+
+      <ConfirmModal
+        isOpen={deleteModal}
+        title="🗑️ 删除确认"
+        message="确定要删除以下域名吗？此操作不可撤销："
+        confirmText="确认删除"
+        cancelText="取消"
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteModal(false)}
+        domains={domainToDelete ? [domainToDelete] : []}
+        showDomainList={true}
+      />
+
+      <ConfirmModal
+        isOpen={batchDeleteModal}
+        title="🗑️ 批量删除确认"
+        message={`确定要批量删除选中的 ${selectedIndexes.length} 个域名吗？此操作不可撤销：`}
+        confirmText="确认删除"
+        cancelText="取消"
+        onConfirm={confirmBatchDelete}
+        onCancel={() => setBatchDeleteModal(false)}
+        domains={selectedIndexes.map(idx => domains[idx])}
+        showDomainList={true}
+      />
+
+      <ExpireModal
+        isOpen={expireModal}
+        expiringDomains={expiringDomains}
+        onClose={handleCloseExpireModal}
+      />
+
+      <InfoModal
+        isOpen={infoModal}
+        title={infoTitle}
+        message={infoMessage}
+        onClose={() => setInfoModal(false)}
+      />
+
+      <PasswordModal
+        isOpen={passwordModal}
+        title="🔐 管理员验证"
+        message={
+          passwordAction === 'delete' && domainToDelete 
+            ? `确定要删除域名 "${domainToDelete.domain}" 吗？此操作需要管理员权限。`
+            : passwordAction === 'edit'
+            ? `确定要编辑域名 "${form.domain}" 吗？此操作需要管理员权限。`
+            : passwordAction === 'renew' && domainToRenew
+            ? `确定要续期域名 "${domainToRenew.domain}" 吗？此操作需要管理员权限。`
+            : `确定要批量删除选中的 ${selectedIndexes.length} 个域名吗？此操作需要管理员权限。`
+        }
+        onConfirm={handlePasswordConfirm}
+        onCancel={handlePasswordCancel}
+        confirmText={
+          passwordAction === 'edit' ? '验证并编辑' 
+          : passwordAction === 'renew' ? '验证并续期'
+          : '验证并删除'
+        }
+        cancelText="取消"
+        deleting={deleting}
+      />
+
+      <SettingsModal
+        isOpen={settingsModal}
+        onClose={() => setSettingsModal(false)}
+        warningDays={warningDays}
+        notificationEnabled={notificationEnabled}
+        notificationInterval={notificationInterval}
+        notificationMethods={notificationMethods}
+        bgImageUrl={bgImageUrl}
+        carouselInterval={carouselInterval}
+        carouselEnabled={carouselEnabled}
+        domains={domains}
+        onSave={handleSettingsSave}
+        onImportDomains={handleImportDomains}
+        onWebDAVBackup={handleWebDAVBackup}
+        onWebDAVRestore={handleWebDAVRestore}
+        onOpenLogs={() => setLogsModal(true)}
+      />
+
+      <LogsModal
+        isOpen={logsModal}
+        onClose={() => setLogsModal(false)}
+      />
+
+    </div>
+  );
+};
+
+export default App; 
