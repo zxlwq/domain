@@ -1,0 +1,40 @@
+name: 同步到Gist
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检查部署地址
+        env:
+          DOMAIN_API_URL: ${{ secrets.DOMAIN_API_URL }}
+        run: |
+          if [[ -z "$DOMAIN_API_URL" ]]; then
+            echo "::error::请在仓库 Actions secrets 中设置 DOMAIN_API_URL"
+            exit 1
+          fi
+
+      - name: 通过 Gist API 备份数据
+        env:
+          DOMAIN_API_URL: ${{ secrets.DOMAIN_API_URL }}
+        run: |
+          response="$(curl --silent --show-error --retry 3 --retry-all-errors --max-time 60 \
+            --request POST "${DOMAIN_API_URL%/}/api/gist" \
+            --header 'Content-Type: application/json' \
+            --data '{"action":"export"}')"
+
+          if ! jq -e '.success == true' >/dev/null <<< "$response"; then
+            echo "::error::Gist 备份失败"
+            jq -r '.error // .message // "API 返回失败"' <<< "$response"
+            exit 1
+          fi
+
+          jq '{message, domainsCount, timestamp}' <<< "$response"
